@@ -1,38 +1,33 @@
 import { AnimatePresence, motion } from 'framer-motion'
-import { useCallback, useRef, useState, type DragEvent, type ChangeEvent } from 'react'
-import { MAX_IMAGE_EDGE, recognizeCharacter, type Prediction } from '../config'
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
+import { recognizeCharacter, type Prediction } from '../config'
+import { cropImage, type CropRect } from '../crop'
+import { pickExamples, type ExamplePhoto } from '../examples'
+import ExamplePhotos from './ExamplePhotos'
+import ImageCropper from './ImageCropper'
 import PredictionsPanel from './PredictionsPanel'
 import SupportedLetters from './SupportedLetters'
 
-const ACCEPT = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-
 const SERVICE_ERROR =
   'Unable to reach the recognition service. Please try again later.'
+const NOT_AN_IMAGE = 'That file isn’t an image. Choose a JPEG, PNG or WebP file.'
+const UNREADABLE_IMAGE =
+  'This image can’t be opened in the browser. Try saving it as a JPEG or PNG first.'
 
-async function downscaleImage(file: File, maxEdge = MAX_IMAGE_EDGE): Promise<Blob> {
-  const bitmap = await createImageBitmap(file)
-  const longest = Math.max(bitmap.width, bitmap.height)
-  const scale = longest > maxEdge ? maxEdge / longest : 1
-  const width = Math.max(1, Math.round(bitmap.width * scale))
-  const height = Math.max(1, Math.round(bitmap.height * scale))
+/** pick an image → select the letter → see the predictions */
+type Stage = 'pick' | 'crop' | 'result'
 
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d')
-  if (!context) {
-    bitmap.close()
-    return file
-  }
-  context.drawImage(bitmap, 0, 0, width, height)
-  bitmap.close()
-
-  const mime = file.type === 'image/png' ? 'image/png' : 'image/jpeg'
-  const blob = await new Promise<Blob | null>((resolve) => {
-    canvas.toBlob((result) => resolve(result), mime, 0.9)
-  })
-  return blob ?? file
+type Source = {
+  url: string
+  type: string
+  /** Set when the image is one of the built-in example photos. */
+  exampleId?: string
 }
+
+const secondaryButton =
+  'w-full border border-bronze bg-paper px-7 py-2 font-serif text-lg text-ink transition-colors duration-200 hover:bg-bronze hover:text-paper sm:w-auto'
+const primaryButton =
+  'w-full border border-bronze bg-bronze px-7 py-2 font-serif text-lg text-paper transition-colors duration-200 hover:border-ink hover:bg-ink sm:w-auto'
 
 function Spinner({ waking }: { waking: boolean }) {
   return (
@@ -54,69 +49,138 @@ function Spinner({ waking }: { waking: boolean }) {
 
 export default function UploadSection() {
   const inputRef = useRef<HTMLInputElement>(null)
+  // Bumped whenever the visitor moves on, so a slow reply for an old image is ignored.
+  const requestRef = useRef(0)
+
+  const [stage, setStage] = useState<Stage>('pick')
   const [isDragging, setIsDragging] = useState(false)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [source, setSource] = useState<Source | null>(null)
+  const [crop, setCrop] = useState<CropRect | null>(null)
+  const [analyzed, setAnalyzed] = useState<{ url: string; cropped: boolean } | null>(null)
   const [predictions, setPredictions] = useState<Prediction[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isWaking, setIsWaking] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const hasImage = Boolean(previewUrl)
 
-  const reset = useCallback(() => {
+  // Free the browser's copy of an image once it's no longer shown.
+  useEffect(() => () => {
+    // Example photos are site assets, not browser copies, so there's nothing to free.
+    if (source?.url.startsWith('blob:')) URL.revokeObjectURL(source.url)
+  }, [source])
+  useEffect(() => () => {
+    if (analyzed) URL.revokeObjectURL(analyzed.url)
+  }, [analyzed])
+
+  const clearResult = () => {
+    requestRef.current += 1
+    setAnalyzed(null)
     setPredictions([])
     setError(null)
     setIsLoading(false)
     setIsWaking(false)
-    setIsDragging(false)
-    setPreviewUrl((current) => {
-      if (current) URL.revokeObjectURL(current)
-      return null
-    })
-    if (inputRef.current) inputRef.current.value = ''
-  }, [])
+  }
 
-  const processFile = useCallback(async (file: File) => {
-    if (!ACCEPT.includes(file.type) && !file.type.startsWith('image/')) {
-      setError('Please upload an image file (JPEG, PNG, or WebP).')
+  const reset = () => {
+    clearResult()
+    setSource(null)
+    setCrop(null)
+    setIsDragging(false)
+    setStage('pick')
+  }
+
+  const processFile = (file: File) => {
+    if (inputRef.current) inputRef.current.value = ''
+    if (!file.type.startsWith('image/')) {
+      setError(NOT_AN_IMAGE)
       return
     }
+    clearResult()
+    setSource({ url: URL.createObjectURL(file), type: file.type })
+    setCrop(null)
+    setStage('crop')
+  }
 
+  const analyze = async (image: Source, area: CropRect | null) => {
+    const id = ++requestRef.current
     setError(null)
+    setAnalyzed(null)
     setPredictions([])
     setIsWaking(false)
-    setPreviewUrl((current) => {
-      if (current) URL.revokeObjectURL(current)
-      return URL.createObjectURL(file)
-    })
     setIsLoading(true)
+    setStage('result')
+
+    let payload: Blob
+    try {
+      payload = await cropImage(image.url, image.type, area)
+    } catch {
+      if (id === requestRef.current) {
+        setIsLoading(false)
+        setError(UNREADABLE_IMAGE)
+      }
+      return
+    }
+    if (id !== requestRef.current) return
+    setAnalyzed({ url: URL.createObjectURL(payload), cropped: area !== null })
 
     try {
-      const payload = await downscaleImage(file)
-      const result = await recognizeCharacter(payload, () => setIsWaking(true))
-      setPredictions(result)
+      const result = await recognizeCharacter(payload, () => {
+        if (id === requestRef.current) setIsWaking(true)
+      })
+      if (id === requestRef.current) setPredictions(result)
     } catch {
-      setError(SERVICE_ERROR)
+      if (id === requestRef.current) setError(SERVICE_ERROR)
     } finally {
-      setIsLoading(false)
-      setIsWaking(false)
+      if (id === requestRef.current) {
+        setIsLoading(false)
+        setIsWaking(false)
+      }
     }
-  }, [])
+  }
+
+  /** Example photos are already cropped to one letter, so they go straight to analysis. */
+  const tryExample = (photo: ExamplePhoto) => {
+    const image: Source = { url: photo.url, type: photo.type, exampleId: photo.id }
+    setSource(image)
+    setCrop(null)
+    void analyze(image, null)
+  }
+
+  const tryAnotherExample = () => {
+    const [next] = pickExamples(1, source?.exampleId ? [source.exampleId] : [])
+    if (next) tryExample(next)
+  }
+
+  const adjustSelection = () => {
+    clearResult()
+    setStage('crop')
+  }
+
+  const onImageError = () => {
+    reset()
+    setError(UNREADABLE_IMAGE)
+  }
 
   const onInputChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
-    if (file) void processFile(file)
+    if (file) processFile(file)
   }
 
-  const onDrop = (event: DragEvent<HTMLButtonElement | HTMLDivElement>) => {
+  const onDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault()
     setIsDragging(false)
     const file = event.dataTransfer.files?.[0]
-    if (file) void processFile(file)
+    if (file) processFile(file)
   }
 
-  const onDragOver = (event: DragEvent<HTMLButtonElement | HTMLDivElement>) => {
+  const onDragOver = (event: DragEvent<HTMLElement>) => {
     event.preventDefault()
     setIsDragging(true)
+  }
+
+  const dropProps = {
+    onDrop,
+    onDragOver,
+    onDragLeave: () => setIsDragging(false),
   }
 
   const frameTone = error
@@ -140,63 +204,113 @@ export default function UploadSection() {
       <SupportedLetters />
 
       <div className="mt-10">
-        {!hasImage ? (
-          <button
-            type="button"
-            onClick={() => inputRef.current?.click()}
-            onDrop={onDrop}
-            onDragOver={onDragOver}
-            onDragLeave={() => setIsDragging(false)}
-            className="group block w-full border border-rule bg-paper p-2.5 text-center sm:p-3"
-          >
-            <span
-              className={`flex flex-col items-center border border-dashed px-6 py-14 transition-colors duration-300 sm:py-20 ${
-                isDragging
-                  ? 'border-bronze bg-linen'
-                  : 'border-bronze-light group-hover:border-bronze group-hover:bg-linen/60'
-              }`}
+        {stage === 'pick' && (
+          <>
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              {...dropProps}
+              className="group block w-full border border-rule bg-paper p-2.5 text-center sm:p-3"
             >
-              <span className="flex h-14 w-14 items-center justify-center rounded-full border border-bronze-light text-bronze transition-colors duration-300 group-hover:border-bronze">
-                <svg
-                  viewBox="0 0 24 24"
-                  className="h-6 w-6"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                  aria-hidden="true"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-7.5L12 3m0 0 4.5 6m-4.5-6v12.75"
-                  />
-                </svg>
+              <span
+                className={`flex flex-col items-center border border-dashed px-6 py-14 transition-colors duration-300 sm:py-20 ${
+                  isDragging
+                    ? 'border-bronze bg-linen'
+                    : 'border-bronze-light group-hover:border-bronze group-hover:bg-linen/60'
+                }`}
+              >
+                <span className="flex h-14 w-14 items-center justify-center rounded-full border border-bronze-light text-bronze transition-colors duration-300 group-hover:border-bronze">
+                  <svg
+                    viewBox="0 0 24 24"
+                    className="h-6 w-6"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                    aria-hidden="true"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-7.5L12 3m0 0 4.5 6m-4.5-6v12.75"
+                    />
+                  </svg>
+                </span>
+                <span className="mt-5 font-serif text-2xl text-ink">Drop an image here</span>
+                <span className="mt-1 text-lg italic text-muted">
+                  or click to browse from your device
+                </span>
+                <span className="mt-5 text-sm text-muted">JPEG, PNG or WebP</span>
               </span>
-              <span className="mt-5 font-serif text-2xl text-ink">Drop an image here</span>
-              <span className="mt-1 text-lg italic text-muted">
-                or click to browse from your device
-              </span>
-              <span className="mt-5 text-sm text-muted">JPEG, PNG or WebP</span>
-            </span>
-          </button>
-        ) : (
+            </button>
+            {error && (
+              <p role="alert" className="mt-4 text-center text-lg text-oxblood">
+                {error}
+              </p>
+            )}
+            <ExamplePhotos onPick={tryExample} />
+          </>
+        )}
+
+        {stage === 'crop' && source && (
+          <div {...dropProps} className="plate px-3 py-5 sm:p-8">
+            <div className="text-center">
+              <h3 className="font-serif text-2xl font-medium text-ink">Select the letter</h3>
+              <p className="mx-auto mt-1 max-w-lg px-2 text-base leading-relaxed text-muted">
+                Drag across the letter you want identified. You can then move the box,
+                or drag its corners and edges to fit it more closely.
+              </p>
+            </div>
+
+            <div className="mt-6 border border-rule bg-linen p-2 sm:p-4">
+              <ImageCropper src={source.url} crop={crop} onChange={setCrop} onError={onImageError} />
+            </div>
+
+            <div className="mt-8 flex flex-wrap justify-center gap-3 border-t border-rule pt-6">
+              <button type="button" onClick={() => void analyze(source, crop)} className={primaryButton}>
+                {crop ? 'Analyze selection' : 'Analyze whole image'}
+              </button>
+              {crop && (
+                <button type="button" onClick={() => setCrop(null)} className={secondaryButton}>
+                  Clear selection
+                </button>
+              )}
+              <button type="button" onClick={reset} className={secondaryButton}>
+                Choose another image
+              </button>
+            </div>
+          </div>
+        )}
+
+        {stage === 'result' && source && (
           <div
-            onDrop={onDrop}
-            onDragOver={onDragOver}
-            onDragLeave={() => setIsDragging(false)}
+            {...dropProps}
             className={`plate p-5 transition-colors duration-300 sm:p-8 ${frameTone}`}
           >
             <div className="grid items-start gap-8 lg:grid-cols-2">
               <figure className="m-0">
                 <div className="border border-rule bg-linen p-2">
-                  <img
-                    src={previewUrl ?? ''}
-                    alt="Uploaded inscription"
-                    className="mx-auto max-h-[420px] w-full object-contain"
-                  />
+                  {analyzed ? (
+                    <img
+                      src={analyzed.url}
+                      alt={
+                        analyzed.cropped
+                          ? 'The selected part of the image'
+                          : source.exampleId
+                            ? 'Example photo'
+                            : 'Uploaded inscription'
+                      }
+                      className="mx-auto max-h-[420px] w-full object-contain"
+                    />
+                  ) : (
+                    <div className="aspect-square max-h-[420px] w-full" />
+                  )}
                 </div>
                 <figcaption className="mt-2 text-center text-base italic text-muted">
-                  Your upload
+                  {analyzed?.cropped
+                    ? 'Your selection'
+                    : source.exampleId
+                      ? 'Example photo'
+                      : 'Your upload'}
                 </figcaption>
               </figure>
 
@@ -234,13 +348,17 @@ export default function UploadSection() {
               </div>
             </div>
 
-            <div className="mt-8 flex justify-center border-t border-rule pt-6">
-              <button
-                type="button"
-                onClick={reset}
-                className="border border-bronze bg-paper px-7 py-2 font-serif text-lg text-ink transition-colors duration-200 hover:bg-bronze hover:text-paper"
-              >
-                Try another image
+            <div className="mt-8 flex flex-wrap justify-center gap-3 border-t border-rule pt-6">
+              <button type="button" onClick={adjustSelection} className={secondaryButton}>
+                Adjust selection
+              </button>
+              {source.exampleId && (
+                <button type="button" onClick={tryAnotherExample} className={secondaryButton}>
+                  Try another example
+                </button>
+              )}
+              <button type="button" onClick={reset} className={secondaryButton}>
+                Choose another image
               </button>
             </div>
           </div>

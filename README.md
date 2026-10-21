@@ -43,6 +43,12 @@ The letters shown above the upload field live in `src/components/SupportedLetter
 
 The image is matched to the letter by file name, so nothing else needs importing.
 
+The same images appear beside each prediction as a reference (`src/letters.ts` holds the list and is shared by both).
+
+## Example photos
+
+Visitors without a photo can pick from the example photos under the upload box; six random ones are shown at a time and one click analyzes it. They live in `src/assets/examples/`, each with a 192px square thumbnail of the same name in `src/assets/examples/thumbs/`. Add or remove files there and the picker updates automatically.
+
 ## API configuration
 
 Edit `src/config.ts`:
@@ -69,7 +75,7 @@ export const API_IMAGE_FIELD = "image";
 
 Confidence values may be `0–1` or `0–100`. Alternate keys such as `class`, `score`, or `probability` are accepted.
 
-Images are downscaled client-side to a maximum edge of 1024px before upload.
+After choosing an image, visitors can drag a box around the letter they want identified (or analyze the whole image). Cropping happens in the browser (`src/crop.ts`, `src/components/ImageCropper.tsx`): only the selected area is sent, downscaled to a maximum edge of 1024px.
 
 If the live API uses a different envelope, adjust `parsePredictions` only — the rest of the UI reads a `{ label, confidence }[]`.
 

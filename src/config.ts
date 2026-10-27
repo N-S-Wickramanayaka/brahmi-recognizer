@@ -14,6 +14,19 @@ export const API_IMAGE_FIELD = 'image'
 /** Longest edge used when downscaling before upload. */
 export const MAX_IMAGE_EDGE = 1024
 
+/**
+ * The model's input size (it was trained on 224 × 224 images). Crops whose
+ * shorter side is smaller than this are enlarged to it before upload, so the
+ * server never has to blow up a tiny image with a basic resize.
+ */
+export const MODEL_INPUT_SIZE = 224
+
+/** Sharpen crops after enlarging them (strength grows with the enlargement). */
+export const SHARPEN_ENLARGED_IMAGES = true
+
+/** Below this shorter side, in the photo's own pixels, warn that the selection is very small. */
+export const VERY_SMALL_EDGE = 64
+
 export type Prediction = {
   label: string
   confidence: number

@@ -1,4 +1,4 @@
-import { useRef, type CSSProperties, type KeyboardEvent, type PointerEvent } from 'react'
+import { useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from 'react'
 import { clamp, type CropRect } from '../crop'
 
 type Handle = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se'
@@ -13,7 +13,14 @@ type ImageCropperProps = {
   crop: CropRect | null
   onChange: (crop: CropRect | null) => void
   onError?: () => void
+  /** Reports the photo's own size once it has loaded. */
+  onImageLoad?: (size: { width: number; height: number }) => void
 }
+
+/** Small photos are shown at least this big (shorter side, in screen pixels) so they're easy to select on. */
+const MIN_DISPLAY_EDGE = 240
+/** Matches the image's max height below. */
+const MAX_DISPLAY_HEIGHT = 'min(65vh, 560px)'
 
 /** Smallest selection, in screen pixels. */
 const MIN_SIZE_PX = 16
@@ -45,9 +52,10 @@ function withMinSize(rect: CropRect, minWidth: number, minHeight: number): CropR
   }
 }
 
-export default function ImageCropper({ src, crop, onChange, onError }: ImageCropperProps) {
+export default function ImageCropper({ src, crop, onChange, onError, onImageLoad }: ImageCropperProps) {
   const frameRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<Drag | null>(null)
+  const [natural, setNatural] = useState<{ src: string; width: number; height: number } | null>(null)
 
   const locate = (event: PointerEvent) => {
     const rect = frameRef.current!.getBoundingClientRect()
@@ -166,6 +174,19 @@ export default function ImageCropper({ src, crop, onChange, onError }: ImageCrop
       }
     : undefined
 
+  // Scale small photos up on screen (never past the available width or height,
+  // and keeping their shape). This only changes how the photo is shown.
+  let displayStyle: CSSProperties | undefined
+  if (natural?.src === src && natural.width > 0 && natural.height > 0) {
+    const enlarge = Math.max(1, MIN_DISPLAY_EDGE / Math.min(natural.width, natural.height))
+    const ratio = natural.width / natural.height
+    displayStyle = {
+      // max-width: 100% (in the class list) keeps it inside narrow screens.
+      width: `min(${natural.width * enlarge}px, calc(${MAX_DISPLAY_HEIGHT} * ${ratio}))`,
+      height: 'auto',
+    }
+  }
+
   return (
     <div className="flex justify-center">
       <div
@@ -181,6 +202,15 @@ export default function ImageCropper({ src, crop, onChange, onError }: ImageCrop
           alt="Your upload"
           draggable={false}
           onError={onError}
+          onLoad={(event) => {
+            const size = {
+              width: event.currentTarget.naturalWidth,
+              height: event.currentTarget.naturalHeight,
+            }
+            setNatural({ src, ...size })
+            onImageLoad?.(size)
+          }}
+          style={displayStyle}
           className="block max-h-[min(65vh,560px)] max-w-full"
         />
 

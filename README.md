@@ -77,6 +77,8 @@ Confidence values may be `0–1` or `0–100`. Alternate keys such as `class`, `
 
 After choosing an image, visitors can drag a box around the letter they want identified (or analyze the whole image). Cropping happens in the browser (`src/crop.ts`, `src/components/ImageCropper.tsx`): only the selected area is sent, downscaled to a maximum edge of 1024px.
 
+Selections smaller than the model's 224px input are enlarged before upload (`src/imageProcessing.ts`): a Lanczos-3 resize so the shorter side reaches 224px, then an unsharp mask on brightness whose strength grows with the enlargement (none below 1.5×), sent as lossless PNG. The cropper shows the selection's size as it is drawn and warns when it is under 64px. The settings live in `src/config.ts` (`MODEL_INPUT_SIZE`, `SHARPEN_ENLARGED_IMAGES`, `VERY_SMALL_EDGE`); set `SHARPEN_ENLARGED_IMAGES = false` to enlarge without sharpening.
+
 If the live API uses a different envelope, adjust `parsePredictions` only — the rest of the UI reads a `{ label, confidence }[]`.
 
 **CORS:** the model host must allow requests from `https://<you>.github.io`.

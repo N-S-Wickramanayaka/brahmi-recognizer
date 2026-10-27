@@ -1,8 +1,9 @@
 import { AnimatePresence, motion } from 'framer-motion'
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
 import { recognizeCharacter, type Prediction } from '../config'
-import { cropImage, type CropRect } from '../crop'
+import { cropImage, cropToPixels, type CropRect, type PreparedImage } from '../crop'
 import { pickExamples, type ExamplePhoto } from '../examples'
+import { planOutput } from '../imageProcessing'
 import ExamplePhotos from './ExamplePhotos'
 import ImageCropper from './ImageCropper'
 import PredictionsPanel from './PredictionsPanel'
@@ -16,6 +17,46 @@ const UNREADABLE_IMAGE =
 
 /** pick an image → select the letter → see the predictions */
 type Stage = 'pick' | 'crop' | 'result'
+
+type Analyzed = Omit<PreparedImage, 'blob'> & {
+  /** Preview of the exact image sent to the model. */
+  url: string
+  cropped: boolean
+}
+
+type Size = { width: number; height: number }
+
+/** "Selection: 80 × 96 px · will be enlarged to 224 × 269 and sharpened", updated live. */
+function SelectionSize({ size, crop }: { size: Size; crop: CropRect | null }) {
+  const area = cropToPixels(crop, size.width, size.height)
+  const plan = planOutput(area.width, area.height)
+  return (
+    <div className="mt-3 text-center text-base leading-relaxed">
+      <p className="text-muted">
+        {crop ? 'Selection' : 'Whole image'}:{' '}
+        <span className="whitespace-nowrap tabular-nums lining-nums">
+          {area.width} × {area.height} px
+        </span>
+        {plan.enlarged && (
+          <>
+            {' '}
+            · will be enlarged to{' '}
+            <span className="whitespace-nowrap tabular-nums lining-nums">
+              {plan.width} × {plan.height}
+            </span>
+            {plan.sharpen ? ' and sharpened' : ''}
+          </>
+        )}
+      </p>
+      {plan.verySmall && (
+        <p className="mt-1 text-oxblood">
+          That&rsquo;s very small, so the result may be less reliable. A closer photo of the
+          letter will work better.
+        </p>
+      )}
+    </div>
+  )
+}
 
 type Source = {
   url: string
@@ -56,7 +97,8 @@ export default function UploadSection() {
   const [isDragging, setIsDragging] = useState(false)
   const [source, setSource] = useState<Source | null>(null)
   const [crop, setCrop] = useState<CropRect | null>(null)
-  const [analyzed, setAnalyzed] = useState<{ url: string; cropped: boolean } | null>(null)
+  const [analyzed, setAnalyzed] = useState<Analyzed | null>(null)
+  const [imageSize, setImageSize] = useState<Size | null>(null)
   const [predictions, setPredictions] = useState<Prediction[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isWaking, setIsWaking] = useState(false)
@@ -83,6 +125,7 @@ export default function UploadSection() {
   const reset = () => {
     clearResult()
     setSource(null)
+    setImageSize(null)
     setCrop(null)
     setIsDragging(false)
     setStage('pick')
@@ -96,6 +139,7 @@ export default function UploadSection() {
     }
     clearResult()
     setSource({ url: URL.createObjectURL(file), type: file.type })
+    setImageSize(null)
     setCrop(null)
     setStage('crop')
   }
@@ -109,9 +153,9 @@ export default function UploadSection() {
     setIsLoading(true)
     setStage('result')
 
-    let payload: Blob
+    let prepared: PreparedImage
     try {
-      payload = await cropImage(image.url, image.type, area)
+      prepared = await cropImage(image.url, image.type, area)
     } catch {
       if (id === requestRef.current) {
         setIsLoading(false)
@@ -120,7 +164,8 @@ export default function UploadSection() {
       return
     }
     if (id !== requestRef.current) return
-    setAnalyzed({ url: URL.createObjectURL(payload), cropped: area !== null })
+    const { blob: payload, ...details } = prepared
+    setAnalyzed({ ...details, url: URL.createObjectURL(payload), cropped: area !== null })
 
     try {
       const result = await recognizeCharacter(payload, () => {
@@ -141,6 +186,7 @@ export default function UploadSection() {
   const tryExample = (photo: ExamplePhoto) => {
     const image: Source = { url: photo.url, type: photo.type, exampleId: photo.id }
     setSource(image)
+    setImageSize(null)
     setCrop(null)
     void analyze(image, null)
   }
@@ -262,8 +308,15 @@ export default function UploadSection() {
             </div>
 
             <div className="mt-6 border border-rule bg-linen p-2 sm:p-4">
-              <ImageCropper src={source.url} crop={crop} onChange={setCrop} onError={onImageError} />
+              <ImageCropper
+                src={source.url}
+                crop={crop}
+                onChange={setCrop}
+                onError={onImageError}
+                onImageLoad={setImageSize}
+              />
             </div>
+            {imageSize && <SelectionSize size={imageSize} crop={crop} />}
 
             <div className="mt-8 flex flex-wrap justify-center gap-3 border-t border-rule pt-6">
               <button type="button" onClick={() => void analyze(source, crop)} className={primaryButton}>
@@ -305,12 +358,28 @@ export default function UploadSection() {
                     <div className="aspect-square max-h-[420px] w-full" />
                   )}
                 </div>
-                <figcaption className="mt-2 text-center text-base italic text-muted">
-                  {analyzed?.cropped
-                    ? 'Your selection'
-                    : source.exampleId
-                      ? 'Example photo'
-                      : 'Your upload'}
+                <figcaption className="mt-2 text-center text-base text-muted">
+                  <span className="italic">
+                    {analyzed?.cropped
+                      ? 'Your selection'
+                      : source.exampleId
+                        ? 'Example photo'
+                        : 'Your upload'}
+                  </span>
+                  {analyzed?.plan.enlarged && (
+                    <span className="mt-0.5 block text-sm">
+                      Enlarged {analyzed.plan.scale.toFixed(1)}× from{' '}
+                      <span className="whitespace-nowrap tabular-nums lining-nums">
+                        {analyzed.sourceWidth} × {analyzed.sourceHeight} px
+                      </span>
+                      {analyzed.plan.sharpen ? ' and sharpened' : ''} for the model
+                    </span>
+                  )}
+                  {analyzed?.plan.verySmall && (
+                    <span className="mt-0.5 block text-sm text-oxblood">
+                      This was a very small area, so treat the result with caution.
+                    </span>
+                  )}
                 </figcaption>
               </figure>
 
